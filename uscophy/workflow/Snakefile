@@ -42,6 +42,8 @@ rule all:
         os.path.join(output_dir , "phylo/busco_phylo.treefile"),
         os.path.join(output_dir, "phylo/overview_matrix.tsv"),
         os.path.join(output_dir , "phylo/busco_tree_plot.pdf"),
+        os.path.join(output_dir, "genetrees.ok"),
+        os.path.join(output_dir, "filtered_alignments.ok"),
         os.path.join(output_dir ,"phylo/genetree/astral_tree.tre") if genetree else [],
         os.path.join(output_dir, "busco/plot_by_category.pdf") if "sample_category_csv" in config else [],
         os.path.join(output_dir , "busco/busco_threshold_plot.png"),
@@ -421,7 +423,179 @@ rule busco_trim:
 ( trimal -in {input} -out {output} -gappyout )&> {log}
 """
 
+##### MODIFICATIONS REQUIRED FOR PARALOGY FILTERING  #####
+rule busco_geneTrees:
+    input:
+        os.path.join(output_dir, "alignments/trimmed/{busco_EOG}.fas")
+    output:
+        tree=os.path.join(output_dir, "phylo/genetree/busco_aa_gene_trees/{busco_EOG}.treefile"),
+        reports=temp(multiext(
+            os.path.join(output_dir, "phylo/genetree/busco_aa_gene_trees/{busco_EOG}"),
+            ".ckp.gz", ".log", ".bionj", ".iqtree", ".contree", ".mldist", ".splits.nex"
+        ))
+    threads: 1
+    params:
+        out_prefix=os.path.join(output_dir, "phylo/genetree/busco_aa_gene_trees/{busco_EOG}"),
+        model=modeltesting
+    conda:
+        "envs/iqtree.yaml"
+    container:
+        "https://depot.galaxyproject.org/singularity/iqtree%3A3.0.1--h503566f_0"
+    log:
+        os.path.join(output_dir, "logs/phylo/iqtree_aa.{busco_EOG}.log")
+    shell:
+        r"""
+        set -euo pipefail
+        (
+            N_UNIQUE=$(awk '/^>/{{if (seq) seqs[seq]++; seq=""}} !/^>/{{gsub(/[[:space:]]/, "", $0); seq=seq toupper($0)}} END{{if (seq) seqs[seq]++; print length(seqs)}}' {input})
+            if [ "$N_UNIQUE" -ge 4 ]; then
+                BOOT_FLAGS="-B 1000 -alrt 1000"
+            else
+                BOOT_FLAGS=""
+                echo "WARNING: Only $N_UNIQUE unique sequences in {wildcards.busco_EOG}, skipping bootstrapping."
+            fi
 
+            iqtree -s {input} \
+                   --prefix {params.out_prefix} \
+                   -T AUTO --threads-max {threads} \
+                   -m {params.model} -msub nuclear $BOOT_FLAGS
+
+            touch {output.tree} {output.reports}
+        ) &> {log} || (
+            echo "IQ-TREE failed for {wildcards.busco_EOG}, creating dummy treefile." >> {log}
+            touch {output.tree} {output.reports}
+        )
+        """
+def get_all_genetrees(wildcards):
+    checkpoint_output = checkpoints.get_sequences.get(**wildcards).output[0]
+    return expand(
+        os.path.join(output_dir, "phylo/genetree/busco_aa_gene_trees/{busco_EOG}.treefile"),
+        busco_EOG=glob_wildcards(os.path.join(checkpoint_output, "{busco_EOG}.fas")).busco_EOG
+    )
+
+
+checkpoint collect_gene_trees:
+    input:
+        get_all_genetrees
+    output:
+        directory(os.path.join(output_dir, "genetrees"))
+    threads: 1
+    log:
+        os.path.join(output_dir, "logs/collect_genetrees.log")
+    shell:
+        """
+[ ! -d {output} ] && mkdir -p {output}
+( for file in {input}; do
+    if [ -s $file ]; then
+        cp $file {output}/ ;
+        echo "$file is nice tree ;-)"
+    else
+        echo "$file is empty"
+    fi
+done )&>{log}
+"""
+
+
+def process_genetrees(wildcards):
+    checkpoint_output = checkpoints.collect_gene_trees.get(**wildcards).output[0]
+    return expand(
+        os.path.join(output_dir, "phylo/genetree/busco_aa_gene_trees/{busco_EOG}.treefile"),
+        busco_EOG=glob_wildcards(os.path.join(checkpoint_output, "{busco_EOG}.treefile")).busco_EOG
+    )
+
+
+rule check:
+    input: process_genetrees
+    output: touch(os.path.join(output_dir, "genetrees.ok"))
+    shell:
+        """
+echo "all trees ready to process..."
+"""
+
+
+rule paralogous_filtering:
+    input:
+        tree_file=os.path.join(output_dir, "phylo/genetree/busco_aa_gene_trees/{busco_EOG}.treefile"),
+        alignment_file=os.path.join(output_dir, "alignments/trimmed/{busco_EOG}.fas")
+    output:
+        adjusted_alignment=os.path.join(output_dir, "phylo/busco_aa_alignments_filtered/{busco_EOG}_adjusted.fas"),
+        paralog_alignment=os.path.join(output_dir, "phylo/busco_aa_alignments_filtered/{busco_EOG}_paralog.fas"),
+        paralog_stats=os.path.join(output_dir, "phylo/busco_aa_alignments_filtered/{busco_EOG}_paralog.stats")
+    threads: 1
+    log:
+        os.path.join(output_dir, "logs/paralogous_filtering.{busco_EOG}.log")
+    conda:
+        "envs/paralog.yaml"
+    container:
+        "docker://tbrown91/ete4_env:v1.0"
+    shell:
+        """
+( python3 {workflow.basedir}/scripts/Paralogous_filtering.py \
+    {input.tree_file} {input.alignment_file} \
+    {output.adjusted_alignment} {output.paralog_alignment} {output.paralog_stats} ) &> {log}
+"""
+
+
+rule clean_header_adjusted:
+    input:
+        os.path.join(output_dir, "phylo/busco_aa_alignments_filtered/{busco_EOG}_adjusted.fas")
+    output:
+        os.path.join(output_dir, "phylo/busco_aa_alignments_filtered_renamed/{busco_EOG}_adjusted.fas")
+    threads: 1
+    log:
+        os.path.join(output_dir, "logs/rename_adjusted.{busco_EOG}.log")
+    shell:
+        """
+awk '/^>/ {{split(substr($0,2),a,"_"); print ">"a[1]"_"a[2]}} !/^>/ {{print}}' {input} > {output}
+"""
+
+
+def get_all_filtered_alignments(wildcards):
+    checkpoint_output = checkpoints.get_sequences.get(**wildcards).output[0]
+    return expand(
+        os.path.join(output_dir, "phylo/busco_aa_alignments_filtered_renamed/{busco_EOG}_adjusted.fas"),
+        busco_EOG=glob_wildcards(os.path.join(checkpoint_output, "{busco_EOG}.fas")).busco_EOG
+    )
+
+
+checkpoint collect_filtered_alignments:
+    input:
+        get_all_filtered_alignments
+    output:
+        directory(os.path.join(output_dir, "filtered_alignments"))
+    threads: 1
+    log:
+        os.path.join(output_dir, "logs/collect_filtered_alignments.log")
+    shell:
+        """
+[ ! -d {output} ] && mkdir -p {output}
+( for file in {input}; do
+    if [ -s $file ]; then
+        cp $file {output}/ ;
+        echo "$file is nice alignment ;-)"
+    else
+        echo "$file is empty"
+    fi
+done )&>{log}
+"""
+
+
+def process_filtered_alignments(wildcards):
+    checkpoint_output = checkpoints.collect_filtered_alignments.get(**wildcards).output[0]
+    return expand(
+        os.path.join(output_dir, "phylo/busco_aa_alignments_filtered_renamed/{busco_EOG}_adjusted.fas"),
+        busco_EOG=glob_wildcards(os.path.join(checkpoint_output, "{busco_EOG}_adjusted.fas")).busco_EOG
+    )
+
+
+rule check_adjusted:
+    input: process_filtered_alignments
+    output: touch(os.path.join(output_dir, "filtered_alignments.ok"))
+    shell:
+        """
+echo "all filtered alignments ready to process..."
+"""
+##### END OF MODIFICATIONS #####
 def aggregate_EOGs(wildcards):
     checkpoint_output = checkpoints.get_sequences.get(**wildcards).output[0]
     return expand(os.path.join(output_dir , "alignments/trimmed/{busco_EOG}.fas"),
@@ -430,7 +604,7 @@ def aggregate_EOGs(wildcards):
 
 rule busco_supermatrix:
     input:
-        aggregate_EOGs
+        process_filtered_alignments
     output:
         matrix=os.path.join(output_dir , "phylo/supermatrix_aa.fas"),
         partitions=os.path.join(output_dir , "phylo/partitions.txt")
@@ -458,7 +632,7 @@ rule overview:
     output:
         table=os.path.join(output_dir, "phylo/overview_matrix.tsv")
     params:
-        in_dir=os.path.join(output_dir , "alignments/trimmed/")
+        in_dir=os.path.join(output_dir, "phylo/busco_aa_alignments_filtered_renamed/")
     conda:
         "envs/bio.yaml"
     log:
@@ -522,34 +696,49 @@ OUTGROUP={params.outgroup}
 
 rule genetree_iqtree:
     input:
-        os.path.join(output_dir , "alignments/trimmed/{busco_EOG}.fas")      
+        os.path.join(output_dir, "phylo/busco_aa_alignments_filtered_renamed/{busco_EOG}_adjusted.fas")
     output:
-        tree=os.path.join(output_dir , "phylo/genetree/{busco_EOG}_genetree.treefile"),
-        rest=temp(multiext(os.path.join(output_dir , "phylo/genetree/{busco_EOG}_genetree"), ".model.gz", ".ckp.gz", ".log", ".bionj", ".iqtree", ".contree", ".mldist", ".splits.nex"))
-    threads: 
+        tree=os.path.join(output_dir, "phylo/genetree/{busco_EOG}_genetree.treefile"),
+        rest=temp(multiext(os.path.join(output_dir, "phylo/genetree/{busco_EOG}_genetree"),
+            ".model.gz", ".ckp.gz", ".log", ".bionj", ".iqtree", ".contree", ".mldist", ".splits.nex"))
+    threads:
         5
     params:
         prefix=lambda wildcards, output: output[0][:-9],
-        #out_prefix="results/phylo/genetree/{busco_EOG}_aa_genetree",
-        model=modeltesting 
+        model=modeltesting
     conda:
         "envs/iqtree.yaml"
     log:
-        os.path.join(output_dir , "logs/phylo/gene_tree/{busco_EOG}.log")
+        os.path.join(output_dir, "logs/phylo/gene_tree/{busco_EOG}.log")
     shell:
-        """
-(   if [ -s {input} ]; then 
-        iqtree -s {input} --prefix {params.prefix} -T AUTO --threads-max {threads} -m {params.model} -msub nuclear -B 1000
-    else 
-        echo "{input} is empty"
-        touch {output.tree} {output.rest} 
-    fi)&>{log}
-        """
+        r"""
+        (
+            if [ -s {input} ]; then
+                N_UNIQUE=$(awk '/^>/{{if (seq) seqs[seq]++; seq=""}} !/^>/{{gsub(/[[:space:]]/, "", $0); seq=seq toupper($0)}} END{{if (seq) seqs[seq]++; print length(seqs)}}' {input})
+                if [ "$N_UNIQUE" -ge 4 ]; then
+                    BOOT_FLAGS="-B 1000"
+                else
+                    BOOT_FLAGS=""
+                    echo "WARNING: Only $N_UNIQUE unique sequences in {wildcards.busco_EOG}, skipping bootstrapping."
+                fi
+                iqtree -s {input} \
+                       --prefix {params.prefix} \
+                       -T AUTO --threads-max {threads} \
+                       -m {params.model} -msub nuclear $BOOT_FLAGS
 
+                touch {output.tree} {output.rest}
+            else
+                echo "{input} is empty"
+                touch {output.tree} {output.rest}
+            fi
+        ) &> {log}
+        """
 def aggregate_EOGs_genetrees(wildcards):
-    checkpoint_output = checkpoints.get_sequences.get(**wildcards).output[0]
-    return expand(os.path.join(output_dir , "phylo/genetree/{busco_EOG}_genetree.treefile"),
-           busco_EOG=glob_wildcards(os.path.join(checkpoint_output, "{busco_EOG}.fas",)).busco_EOG)
+    checkpoint_output = checkpoints.collect_filtered_alignments.get(**wildcards).output[0]
+    return expand(
+        os.path.join(output_dir, "phylo/genetree/{busco_EOG}_genetree.treefile"),
+        busco_EOG=glob_wildcards(os.path.join(checkpoint_output, "{busco_EOG}_adjusted.fas")).busco_EOG
+    )
 
 rule genetree_collect:
     input:
