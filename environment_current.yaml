@@ -21,6 +21,7 @@ dependencies:
   - configargparse=1.7.1=pyhe01879c_0
   - diamond=2.1.13=h13889ed_0
   - entrez-direct=22.4=he881be0_0
+  - ete4=4.3.0=py311h49ec1c0_1 
   - fastp=0.25.0=heae3180_0
   - gawk=5.3.1=hcd3d067_0
   - gotree=0.5.0=he881be0_0
